@@ -129,8 +129,3 @@ Laurens Verweij — Prinses Máxima Centrum / Utrecht University
 Supervisors: Hans Clevers, Marc van de Wetering
 '
 
-## Write to file
-writeLines(readme_text, "README.md")
-cat("[Saved] README.md\n")
-cat("Preview first 10 lines:\n")
-cat(readLines("README.md")[1:10], sep = "\n")
