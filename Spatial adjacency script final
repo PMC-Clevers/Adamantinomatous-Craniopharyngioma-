@@ -1,0 +1,1206 @@
+################################################################################
+#  Spatial adjacency analysis — ACP Xenium data
+#  Version 4.1 — Final
+#
+#  Three analyses:
+#  1. Individual population pairs — permutation NN distance test
+#     Positive controls: adjacent developmental pairs
+#     Negative controls: non-adjacent skip pairs
+#
+#  2. Stage-level analysis — Bud/Cap/Bell/Eruption
+#     Per patient (ROIs pooled), sequential vs skip controls
+#
+#  3. Unbiased proximity landscape — all cell types vs all cell types
+#     a. NN distance method (physical micrometres)
+#     b. Neighborhood enrichment z-score (Squidpy-equivalent, k=6, undirected)
+#
+#  Stage definitions:
+#  Bud:      OE1 + OE2 + OE3 + Transitioning + Dental Epithelium
+#  Cap:      Dental Epithelium/OEE + SI/SR + Cluster Cells + SR-stress
+#  Bell:     Pre-ameloblast + Ameloblast
+#  Eruption: JK + JB + SK + SB + PDL
+#
+#  Only cell types in ≥3 patients shown in proximity landscapes
+#  All plots at publication quality (base_size = 16, 300 dpi)
+#
+#  Input:  20251103_xenium-nobt259.rds
+#  Output: results/spatial_adjacency_v4/
+#
+#  Author: Laurens Verweij
+#  Date:   2026
+################################################################################
+
+## ---- 0) Packages ----
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(parallel)
+library(purrr)
+library(tidyr)
+library(tibble)
+library(FNN)
+library(pheatmap)
+library(viridis)
+
+use_FNN   <- TRUE
+MIN_CELLS <- 20
+N_PERM    <- 1000
+SEED      <- 42
+K_NHOOD   <- 6       ## Squidpy default
+
+## Publication theme settings
+PUB_BASE   <- 16
+PUB_AXIS   <- 13
+PUB_STRIP  <- 13
+PUB_TITLE  <- 16
+PUB_LEGEND <- 13
+
+out_dir <- "results/spatial_adjacency_v4"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+## ---- 1) Load xenium ----
+xenium <- readRDS("20251103_xenium-nobt259.rds")
+cat("Xenium loaded:", ncol(xenium), "cells\n")
+annot_col <- "annotation_v2"
+
+## ---- 2) Patient → ROI mapping ----
+patient_map <- list(
+  ACP004 = c("ROI_BT288_1"),
+  ACP005 = c("ROI_TMA4",  "ROI_TMA9"),
+  ACP006 = c("ROI_TMA1",  "ROI_TMA8",  "ROI_TMA13"),
+  ACP007 = c("ROI_TMA2",  "ROI_TMA3",  "ROI_TMA6",
+             "ROI_TMA7",  "ROI_TMA10", "ROI_TMA11", "ROI_TMA14"),
+  ACP008 = c("ROI_TMA12")
+)
+
+## ---- 3) Annotation labels ----
+labs_OE    <- c("Oral Epithelium 1", "Oral Epithelium 2", "Oral Epithelium 3")
+labs_TR    <- "Transitioning"
+labs_DE    <- "Dental Epithelium"
+labs_DEOEE <- "Dental Epithelium / OEE"
+labs_SISR  <- "SI / SR"
+labs_CC    <- "Cluster Cells"
+labs_pre   <- "Pre-ameloblast"
+labs_AMB   <- "Ameloblast"
+labs_JK    <- "Junctional Keratinocytes"
+labs_SK    <- "Sulcus Keratinocytes"
+labs_SB    <- "Sulcus basal"
+labs_JB    <- "Junctional basal"
+labs_PDL   <- "PDL"
+
+## ---- 4) Stage definitions (full — filtered later to ≥3 patients) ----
+labs_BUD_full   <- c("Oral Epithelium 1", "Oral Epithelium 2",
+                     "Oral Epithelium 3", "Transitioning",
+                     "Dental Epithelium")
+labs_CAP_full   <- c("Dental Epithelium / OEE", "SI / SR",
+                     "Cluster Cells", "SR – stress")
+labs_BELL_full  <- c("Pre-ameloblast", "Ameloblast")
+labs_ERUPT_full <- c("Junctional Keratinocytes", "Junctional basal",
+                     "Sulcus Keratinocytes", "Sulcus basal", "PDL")
+
+## Stage colour mapping
+stage_map <- c(
+  "Oral Epithelium 1"           = "Bud",
+  "Oral Epithelium 2"           = "Bud",
+  "Oral Epithelium 3"           = "Bud",
+  "Transitioning"               = "Bud",
+  "Dental Epithelium"           = "Bud",
+  "Dental Epithelium / OEE"     = "Cap",
+  "SI / SR"                     = "Cap",
+  "Cluster Cells"               = "Cap",
+  "SR – stress"                 = "Cap",
+  "Pre-ameloblast"              = "Bell",
+  "Ameloblast"                  = "Bell",
+  "Junctional Keratinocytes"    = "Eruption",
+  "Junctional basal"            = "Eruption",
+  "Sulcus Keratinocytes"        = "Eruption",
+  "Sulcus basal"                = "Eruption",
+  "PDL"                         = "Eruption",
+  "CCL2 inflamed keratinocytes" = "Other",
+  "Cycling"                     = "Other",
+  "Endothelial"                 = "Other",
+  "Glial"                       = "Other",
+  "Myeloid"                     = "Other",
+  "ATF3"                        = "Other",
+  "BEST3 / SOX2"                = "Other",
+  "CHGB population"             = "Other",
+  "IGFBP5"                      = "Other",
+  "LYZ oral"                    = "Other",
+  "Oral basal"                  = "Other",
+  "Stress"                      = "Other"
+)
+
+stage_order   <- c("Bud", "Cap", "Bell", "Eruption", "Other")
+stage_colours <- c(
+  "Bud"      = "#4393C3",
+  "Cap"      = "#74C476",
+  "Bell"     = "#F4A582",
+  "Eruption" = "#D6604D",
+  "Other"    = "grey70"
+)
+
+source_order_full <- c(
+  "Oral Epithelium 1", "Oral Epithelium 2", "Oral Epithelium 3",
+  "Transitioning", "Dental Epithelium",
+  "Dental Epithelium / OEE", "SI / SR", "Cluster Cells",
+  "Pre-ameloblast", "Ameloblast",
+  "Junctional Keratinocytes", "Junctional basal",
+  "Sulcus Keratinocytes", "Sulcus basal", "PDL",
+  "CCL2 inflamed keratinocytes", "Endothelial", "Glial",
+  "Myeloid", "ATF3", "CHGB population", "IGFBP5",
+  "LYZ oral", "Oral basal", "Stress"
+)
+
+type_colours <- c("positive" = "#2166AC", "negative" = "#B2182B")
+
+## ---- 5) Helper functions ----
+
+get_xy <- function(obj) {
+  coords <- GetTissueCoordinates(obj)
+  cn     <- colnames(coords)
+  if (all(c("imagecol", "imagerow") %in% cn)) {
+    coords <- coords[, c("imagecol", "imagerow")]
+    colnames(coords) <- c("x", "y")
+  } else {
+    coords <- coords[, c("x", "y")]
+  }
+  coords
+}
+
+nn_distance <- function(df_from, df_to) {
+  if (nrow(df_from) == 0L || nrow(df_to) == 0L)
+    return(rep(NA_real_, max(nrow(df_from), 1L)))
+  from_mat <- as.matrix(df_from[, c("x", "y")])
+  to_mat   <- as.matrix(df_to[,   c("x", "y")])
+  as.numeric(FNN::get.knnx(to_mat, from_mat, k = 1)$nn.dist[, 1])
+}
+
+permute_nn_test <- function(df, label_col, labs_A, labs_B,
+                            n_perm = N_PERM, seed = SEED,
+                            min_cells = MIN_CELLS) {
+  A <- df[df[[label_col]] %in% labs_A, ]
+  B <- df[df[[label_col]] %in% labs_B, ]
+  if (nrow(A) < min_cells || nrow(B) < min_cells)
+    return(list(n_A = nrow(A), n_B = nrow(B),
+                observed = NA_real_, null_median = NA_real_,
+                null_q025 = NA_real_, null_q975 = NA_real_,
+                p_value = NA_real_, significant = NA, skipped = TRUE))
+  obs    <- median(nn_distance(A, B), na.rm = TRUE)
+  idx    <- df[[label_col]] %in% c(labs_A, labs_B)
+  df_sub <- df[idx, ]
+  n_cores <- max(1L, detectCores() - 1L)
+  cl <- makeCluster(n_cores)
+  on.exit(stopCluster(cl), add = TRUE)
+  clusterExport(cl,
+                varlist = c("df_sub", "label_col", "labs_A", "labs_B",
+                            "nn_distance", "use_FNN"),
+                envir = environment())
+  clusterSetRNGStream(cl, seed)
+  if (use_FNN) clusterEvalQ(cl, library(FNN))
+  perm_medians <- unlist(parLapply(cl, seq_len(n_perm), function(i) {
+    df_perm <- df_sub
+    df_perm[[label_col]] <- sample(df_sub[[label_col]])
+    A_p <- df_perm[df_perm[[label_col]] %in% labs_A, ]
+    B_p <- df_perm[df_perm[[label_col]] %in% labs_B, ]
+    if (nrow(A_p) == 0L || nrow(B_p) == 0L) return(NA_real_)
+    median(nn_distance(A_p, B_p), na.rm = TRUE)
+  }))
+  p_val <- mean(perm_medians >= obs, na.rm = TRUE)
+  list(n_A = nrow(A), n_B = nrow(B), observed = obs,
+       null_median = median(perm_medians,          na.rm = TRUE),
+       null_q025   = quantile(perm_medians, 0.025, na.rm = TRUE),
+       null_q975   = quantile(perm_medians, 0.975, na.rm = TRUE),
+       p_value = p_val, significant = p_val < 0.05, skipped = FALSE)
+}
+
+build_df <- function(roi_name) {
+  cells  <- Cells(xenium@images[[roi_name]])
+  coords <- get_xy(subset(xenium, cells = cells))
+  coords$cell <- cells
+  meta        <- xenium@meta.data[cells, , drop = FALSE]
+  meta$cell   <- rownames(meta)
+  dplyr::inner_join(meta, coords, by = "cell")
+}
+
+build_patient_df <- function(patient) {
+  dplyr::bind_rows(purrr::map(patient_map[[patient]], function(rn) {
+    if (!rn %in% names(xenium@images)) return(NULL)
+    build_df(rn)
+  }))
+}
+
+## Squidpy-equivalent neighborhood enrichment
+## k=6 (Squidpy default), undirected (symmetrized), z-score = (obs-mean)/sd
+run_nhood_enrichment_squidpy <- function(df, label_col,
+                                          k = K_NHOOD, n_perm = N_PERM,
+                                          seed = SEED) {
+  set.seed(seed)
+  coords     <- as.matrix(df[, c("x", "y")])
+  labels     <- factor(df[[label_col]])
+  cell_types <- levels(labels)
+  n_types    <- length(cell_types)
+  cat("    Building kNN graph (k=", k, ", n=", nrow(coords), ")...\n")
+  knn_res  <- FNN::get.knn(coords, k = k)
+  from_idx <- rep(seq_len(nrow(knn_res$nn.index)), each = k)
+  to_idx   <- as.vector(t(knn_res$nn.index))
+  from_int <- as.integer(labels)[from_idx]
+  to_int   <- as.integer(labels)[to_idx]
+  count_pairs_fast <- function(fi, ti) {
+    m <- matrix(
+      tabulate(fi + n_types * (ti - 1L), nbins = n_types * n_types),
+      nrow = n_types, ncol = n_types,
+      dimnames = list(cell_types, cell_types))
+    m + t(m)  ## symmetrize = undirected
+  }
+  cat("    Computing observed counts...\n")
+  obs_matrix <- count_pairs_fast(from_int, to_int)
+  cat("    Running", n_perm, "permutations (parallel)...\n")
+  n_cores <- max(1L, parallel::detectCores() - 1L)
+  cl <- parallel::makeCluster(n_cores)
+  on.exit(parallel::stopCluster(cl), add = TRUE)
+  parallel::clusterExport(
+    cl,
+    varlist = c("labels", "from_idx", "to_idx", "from_int", "to_int",
+                "cell_types", "n_types", "count_pairs_fast"),
+    envir = environment())
+  parallel::clusterSetRNGStream(cl, seed)
+  perm_list <- parallel::parLapply(cl, seq_len(n_perm), function(i) {
+    perm_int <- sample(as.integer(labels))
+    count_pairs_fast(perm_int[from_idx], perm_int[to_idx])
+  })
+  cat("    Computing z-scores...\n")
+  perm_array <- array(unlist(perm_list), dim = c(n_types, n_types, n_perm))
+  perm_mean  <- apply(perm_array, c(1, 2), mean)
+  perm_sd    <- apply(perm_array, c(1, 2), sd)
+  perm_sd[perm_sd == 0] <- 1
+  z_matrix <- (obs_matrix - perm_mean) / perm_sd
+  dimnames(z_matrix) <- list(cell_types, cell_types)
+  p_matrix <- matrix(NA_real_, n_types, n_types,
+                     dimnames = list(cell_types, cell_types))
+  for (i in seq_len(n_types))
+    for (j in seq_len(n_types))
+      p_matrix[i, j] <- mean(perm_array[i, j, ] >= obs_matrix[i, j])
+  list(zscore = z_matrix, pvalue = p_matrix,
+       observed = obs_matrix, null_mean = perm_mean)
+}
+
+## Non-linear breaks for z-score heatmap
+## Makes colour transition sharper near zero
+make_nonlinear_breaks <- function(z_min, z_max, n = 101, power = 0.3) {
+  neg <- -((seq(0, 1, length.out = ceiling(n/2)))^(1/power)) * abs(z_min)
+  pos <-  ((seq(0, 1, length.out = floor(n/2)+1))^(1/power)) * z_max
+  unique(sort(c(neg, pos)))
+}
+
+## Publication theme
+pub_theme <- function() {
+  theme_classic(base_size = PUB_BASE) +
+    theme(
+      axis.text.x        = element_text(angle = 45, hjust = 1, size = PUB_AXIS),
+      axis.text.y        = element_text(size = PUB_AXIS),
+      axis.title         = element_text(size = PUB_TITLE),
+      legend.text        = element_text(size = PUB_LEGEND),
+      legend.title       = element_text(size = PUB_LEGEND),
+      strip.text         = element_text(size = PUB_STRIP, face = "bold"),
+      strip.background   = element_rect(fill = "grey95", colour = NA),
+      panel.grid.major.y = element_line(colour = "grey92", linewidth = 0.4)
+    )
+}
+
+save_plot <- function(p, name, width = 12, height = 6) {
+  ggsave(file.path(out_dir, paste0(name, ".pdf")),
+         p, width = width, height = height)
+  ggsave(file.path(out_dir, paste0(name, ".png")),
+         p, width = width, height = height, dpi = 300)
+  cat("[Saved]", name, "\n")
+}
+
+save_pheatmap <- function(mat, name, colour, breaks,
+                           anno, anno_col, width = 16, height = 14,
+                           title = "") {
+  for (ext in c("pdf", "png")) {
+    fname <- file.path(out_dir, paste0(name, ".", ext))
+    if (ext == "pdf") pdf(fname, width = width, height = height)
+    else              png(fname, width = width, height = height,
+                          units = "in", res = 300)
+    pheatmap::pheatmap(
+      mat,
+      clustering_distance_rows = "euclidean",
+      clustering_distance_cols = "euclidean",
+      clustering_method        = "ward.D2",
+      annotation_row           = anno,
+      annotation_col           = anno,
+      annotation_colors        = anno_col,
+      color                    = colour,
+      breaks                   = breaks,
+      show_rownames             = TRUE,
+      show_colnames             = TRUE,
+      fontsize                  = 14,
+      fontsize_row              = 13,
+      fontsize_col              = 13,
+      main                      = title
+    )
+    dev.off()
+  }
+  cat("[Saved]", name, "\n")
+}
+
+## ============================================================
+## STEP 0: Cell type reliability filter
+## ============================================================
+cat("\n=== Step 0: Reliability filter (≥3 patients) ===\n")
+
+all_counts <- dplyr::bind_rows(purrr::map(names(patient_map), function(patient) {
+  df <- build_patient_df(patient)
+  tab <- table(df[[annot_col]])
+  data.frame(patient = patient, cell_type = names(tab),
+             n_cells = as.integer(tab))
+}))
+
+reliable_types <- all_counts %>%
+  dplyr::filter(n_cells >= MIN_CELLS) %>%
+  dplyr::group_by(cell_type) %>%
+  dplyr::summarise(n_patients = dplyr::n(), .groups = "drop") %>%
+  dplyr::filter(n_patients >= 3) %>%
+  dplyr::pull(cell_type)
+
+cat("Reliable cell types (≥3 patients):", length(reliable_types), "\n")
+
+## Filter stage groupings
+labs_BUD   <- intersect(labs_BUD_full,   reliable_types)
+labs_CAP   <- intersect(labs_CAP_full,   reliable_types)
+labs_BELL  <- intersect(labs_BELL_full,  reliable_types)
+labs_ERUPT <- intersect(labs_ERUPT_full, reliable_types)
+
+cat("Bud:     ", paste(labs_BUD,   collapse = ", "), "\n")
+cat("Cap:     ", paste(labs_CAP,   collapse = ", "), "\n")
+cat("Bell:    ", paste(labs_BELL,  collapse = ", "), "\n")
+cat("Eruption:", paste(labs_ERUPT, collapse = ", "), "\n")
+
+source_order_f <- intersect(source_order_full, reliable_types)
+
+## ============================================================
+## STEP 1: Define pairs
+## ============================================================
+
+pairs_positive <- list(
+  list(from = labs_OE,    to = labs_TR,    name = "OE → TR",
+       type = "positive", axis = "bud"),
+  list(from = labs_TR,    to = labs_DE,    name = "TR → DE",
+       type = "positive", axis = "bud"),
+  list(from = labs_DE,    to = labs_DEOEE, name = "DE → DEOEE",
+       type = "positive", axis = "cap"),
+  list(from = labs_DEOEE, to = labs_SISR,  name = "DEOEE → SI/SR",
+       type = "positive", axis = "cap"),
+  list(from = labs_DEOEE, to = labs_CC,    name = "DEOEE → Cluster Cells",
+       type = "positive", axis = "cap"),
+  list(from = labs_SISR,  to = labs_CC,    name = "SI/SR → Cluster Cells",
+       type = "positive", axis = "cap"),
+  list(from = labs_pre,   to = labs_AMB,   name = "pre-AMB → AMB",
+       type = "positive", axis = "bell"),
+  list(from = labs_AMB,   to = labs_JK,    name = "AMB → JK",
+       type = "positive", axis = "eruption"),
+  list(from = labs_AMB,   to = labs_JB,    name = "AMB → JB",
+       type = "positive", axis = "eruption"),
+  list(from = labs_JB,    to = labs_JK,    name = "JB → JK",
+       type = "positive", axis = "eruption"),
+  list(from = labs_SK,    to = labs_JK,    name = "SK → JK",
+       type = "positive", axis = "eruption"),
+  list(from = labs_OE,    to = labs_SB,    name = "OE → SB",
+       type = "positive", axis = "eruption"),
+  list(from = labs_OE,    to = labs_JB,    name = "OE → JB",
+       type = "positive", axis = "eruption")
+)
+
+pairs_negative <- list(
+  list(from = labs_OE,  to = labs_SISR, name = "OE → SI/SR (skip cap)",
+       type = "negative", axis = "control"),
+  list(from = labs_OE,  to = labs_AMB,  name = "OE → AMB (skip all)",
+       type = "negative", axis = "control"),
+  list(from = labs_DE,  to = labs_AMB,  name = "DE → AMB (skip SI/SR+pre)",
+       type = "negative", axis = "control"),
+  list(from = labs_TR,  to = labs_AMB,  name = "TR → AMB (skip 3 steps)",
+       type = "negative", axis = "control")
+)
+
+pairs_all <- c(pairs_positive, pairs_negative)
+
+pairs_stages <- list(
+  list(from = labs_BUD,   to = labs_CAP,   name = "Bud → Cap",
+       type = "sequential"),
+  list(from = labs_CAP,   to = labs_BELL,  name = "Cap → Bell",
+       type = "sequential"),
+  list(from = labs_BELL,  to = labs_ERUPT, name = "Bell → Eruption",
+       type = "sequential"),
+  list(from = labs_BUD,   to = labs_BELL,  name = "Bud → Bell (skip 1)",
+       type = "skip"),
+  list(from = labs_CAP,   to = labs_ERUPT, name = "Cap → Eruption (skip 1)",
+       type = "skip"),
+  list(from = labs_BUD,   to = labs_ERUPT, name = "Bud → Eruption (skip all)",
+       type = "skip")
+)
+
+pos_order <- c("OE → TR", "TR → DE", "DE → DEOEE",
+               "DEOEE → SI/SR", "DEOEE → Cluster Cells",
+               "SI/SR → Cluster Cells", "pre-AMB → AMB",
+               "AMB → JK", "AMB → JB", "JB → JK", "SK → JK",
+               "OE → SB", "OE → JB")
+neg_order       <- c("OE → SI/SR (skip cap)", "TR → AMB (skip 3 steps)",
+                     "DE → AMB (skip SI/SR+pre)", "OE → AMB (skip all)")
+all_order       <- c(pos_order, neg_order)
+stage_seq_order <- c("Bud → Cap", "Cap → Bell", "Bell → Eruption")
+stage_all_order <- c(stage_seq_order, "Bud → Bell (skip 1)",
+                     "Cap → Eruption (skip 1)", "Bud → Eruption (skip all)")
+
+## ============================================================
+## ANALYSIS 1: Individual pairs — permutation NN distance (per ROI)
+## ============================================================
+cat("\n=== Analysis 1: Individual pairs (per ROI) ===\n")
+
+results_individual <- list()
+for (patient in names(patient_map)) {
+  cat("=== Patient:", patient, "===\n")
+  roi_list <- list()
+  for (rn in patient_map[[patient]]) {
+    if (!rn %in% names(xenium@images)) { cat("  [SKIP]", rn, "\n"); next }
+    cat("  ROI:", rn, "\n")
+    df <- build_df(rn)
+    roi_list[[rn]] <- dplyr::bind_rows(lapply(pairs_all, function(p) {
+      cat("    ·", p$name, "")
+      res         <- permute_nn_test(df, annot_col, p$from, p$to)
+      res$pair    <- p$name
+      res$type    <- p$type
+      res$axis    <- p$axis
+      res$roi     <- rn
+      res$patient <- patient
+      if (isTRUE(res$skipped)) cat("[skipped]\n")
+      else cat(sprintf("obs=%.1fµm | null=%.1fµm | p=%.3f\n",
+                       res$observed, res$null_median, res$p_value))
+      as.data.frame(res)
+    }))
+  }
+  results_individual[[patient]] <- dplyr::bind_rows(roi_list)
+}
+
+ind_df <- dplyr::bind_rows(results_individual)
+ind_df$pair <- factor(ind_df$pair, levels = all_order)
+ind_df$type <- factor(ind_df$type, levels = c("positive", "negative"))
+
+ind_summary <- ind_df %>%
+  dplyr::filter(!is.na(observed)) %>%
+  dplyr::group_by(patient, pair, type, axis) %>%
+  dplyr::summarise(
+    n_rois          = dplyr::n(),
+    median_observed = median(observed,    na.rm = TRUE),
+    median_null     = median(null_median, na.rm = TRUE),
+    median_pval     = median(p_value,     na.rm = TRUE),
+    n_sig_rois      = sum(significant,    na.rm = TRUE),
+    .groups = "drop")
+
+write.csv(ind_df,      file.path(out_dir, "spatial_nn_individual_per_ROI.csv"),
+          row.names = FALSE)
+write.csv(ind_summary, file.path(out_dir, "spatial_nn_individual_per_patient.csv"),
+          row.names = FALSE)
+cat("[Saved] Analysis 1 CSVs\n")
+
+## ============================================================
+## ANALYSIS 2: Stage pairs — per patient pooled
+## ============================================================
+cat("\n=== Analysis 2: Stage pairs (per patient pooled) ===\n")
+
+results_stages <- list()
+for (patient in names(patient_map)) {
+  cat("=== Patient:", patient, "===\n")
+  df_patient <- build_patient_df(patient)
+  cat("  Cells pooled:", nrow(df_patient), "\n")
+  results_stages[[patient]] <- dplyr::bind_rows(lapply(pairs_stages, function(p) {
+    cat("  ·", p$name, "")
+    res         <- permute_nn_test(df_patient, annot_col, p$from, p$to)
+    res$pair    <- p$name
+    res$type    <- p$type
+    res$patient <- patient
+    res$n_rois  <- length(patient_map[[patient]])
+    if (isTRUE(res$skipped)) cat("[skipped]\n")
+    else cat(sprintf("obs=%.1fµm | null=%.1fµm | p=%.3f\n",
+                     res$observed, res$null_median, res$p_value))
+    as.data.frame(res)
+  }))
+}
+
+stage_df <- dplyr::bind_rows(results_stages)
+stage_df$pair <- factor(stage_df$pair, levels = stage_all_order)
+stage_df$type <- factor(stage_df$type, levels = c("sequential", "skip"))
+
+write.csv(stage_df, file.path(out_dir, "spatial_nn_stages_per_patient.csv"),
+          row.names = FALSE)
+cat("[Saved] Analysis 2 CSV\n")
+
+## ============================================================
+## ANALYSIS 3a: Unbiased NN distance landscape
+## ============================================================
+cat("\n=== Analysis 3a: Unbiased NN distance landscape ===\n")
+
+all_cell_types <- names(which(
+  table(xenium@meta.data[[annot_col]]) >= MIN_CELLS))
+
+all_pairwise <- dplyr::bind_rows(purrr::map(names(patient_map), function(patient) {
+  cat("  Patient:", patient, "\n")
+  df_patient <- build_patient_df(patient)
+  dplyr::bind_rows(purrr::map(all_cell_types, function(src) {
+    A <- df_patient[df_patient[[annot_col]] == src, ]
+    if (nrow(A) < MIN_CELLS) return(NULL)
+    dplyr::bind_rows(purrr::map(all_cell_types, function(tgt) {
+      if (src == tgt) return(NULL)
+      B <- df_patient[df_patient[[annot_col]] == tgt, ]
+      if (nrow(B) < MIN_CELLS) return(NULL)
+      data.frame(source      = src,
+                 target      = tgt,
+                 median_dist = median(nn_distance(A, B), na.rm = TRUE),
+                 patient     = patient)
+    }))
+  }))
+}))
+
+write.csv(all_pairwise,
+          file.path(out_dir, "all_pairwise_distances.csv"),
+          row.names = FALSE)
+cat("[Saved] all_pairwise_distances.csv\n")
+
+reliable_sources <- all_pairwise %>%
+  dplyr::group_by(source) %>%
+  dplyr::summarise(n_pts = dplyr::n_distinct(patient), .groups = "drop") %>%
+  dplyr::filter(n_pts >= 3) %>%
+  dplyr::pull(source)
+
+pairwise_summary <- all_pairwise %>%
+  dplyr::group_by(source, target) %>%
+  dplyr::summarise(
+    median_dist = median(median_dist, na.rm = TRUE),
+    sd_dist     = sd(median_dist,    na.rm = TRUE),
+    n_patients  = dplyr::n(),
+    .groups = "drop") %>%
+  dplyr::mutate(
+    target_stage = dplyr::recode(target, !!!stage_map),
+    target_stage = ifelse(is.na(target_stage), "Other", target_stage),
+    target_stage = factor(target_stage, levels = stage_order))
+
+pairwise_summary_f <- pairwise_summary %>%
+  dplyr::filter(source %in% reliable_sources,
+                target %in% reliable_sources)
+
+write.csv(pairwise_summary_f,
+          file.path(out_dir, "pairwise_distance_summary.csv"),
+          row.names = FALSE)
+cat("[Saved] pairwise_distance_summary.csv\n")
+
+## ============================================================
+## ANALYSIS 3b: Neighborhood enrichment — Squidpy-equivalent
+## ============================================================
+cat("\n=== Analysis 3b: Neighborhood enrichment (k=6, undirected) ===\n")
+
+full_nhood_results <- list()
+for (patient in names(patient_map)) {
+  cat("=== Patient:", patient, "===\n")
+  rds_file <- file.path(out_dir, paste0("zscore_k6_", patient, ".rds"))
+  if (file.exists(rds_file)) {
+    cat("  Loading cached result...\n")
+    full_nhood_results[[patient]] <- readRDS(rds_file)
+    next
+  }
+  df_patient <- build_patient_df(patient)
+  cat("  Cells pooled:", nrow(df_patient), "\n")
+  enrich <- run_nhood_enrichment_squidpy(
+    df_patient, annot_col, k = K_NHOOD, n_perm = N_PERM, seed = SEED)
+  z_long <- as.data.frame(enrich$zscore) %>%
+    tibble::rownames_to_column("source") %>%
+    tidyr::pivot_longer(cols = -source, names_to = "target",
+                        values_to = "zscore") %>%
+    dplyr::filter(source != target) %>%
+    dplyr::mutate(patient = patient)
+  full_nhood_results[[patient]] <- z_long
+  saveRDS(z_long, rds_file)
+  cat("  Done!\n")
+}
+
+full_nhood_df <- dplyr::bind_rows(full_nhood_results)
+write.csv(full_nhood_df,
+          file.path(out_dir, "full_pairwise_zscore_k6_squidpy.csv"),
+          row.names = FALSE)
+cat("[Saved] full_pairwise_zscore_k6_squidpy.csv\n")
+
+zscore_summary <- full_nhood_df %>%
+  dplyr::group_by(source, target) %>%
+  dplyr::summarise(
+    median_zscore = median(zscore, na.rm = TRUE),
+    sd_zscore     = sd(zscore,    na.rm = TRUE),
+    n_patients    = dplyr::n(),
+    .groups = "drop") %>%
+  dplyr::mutate(
+    target_stage = dplyr::recode(target, !!!stage_map),
+    target_stage = ifelse(is.na(target_stage), "Other", target_stage),
+    target_stage = factor(target_stage, levels = stage_order))
+
+zscore_summary_f <- zscore_summary %>%
+  dplyr::filter(source %in% reliable_sources,
+                target %in% reliable_sources)
+
+full_nhood_f <- full_nhood_df %>%
+  dplyr::filter(source %in% reliable_sources,
+                target %in% reliable_sources)
+
+write.csv(zscore_summary_f,
+          file.path(out_dir, "zscore_summary_k6_squidpy.csv"),
+          row.names = FALSE)
+cat("[Saved] zscore_summary_k6_squidpy.csv\n")
+
+## ============================================================
+## BUILD RAW DISTANCES for violin/density plots
+## ============================================================
+cat("\nBuilding raw distances for plots...\n")
+
+raw_all_new <- dplyr::bind_rows(purrr::map(names(patient_map), function(patient) {
+  dplyr::bind_rows(purrr::map(patient_map[[patient]], function(rn) {
+    if (!rn %in% names(xenium@images)) return(NULL)
+    df <- build_df(rn)
+    dplyr::bind_rows(purrr::map(pairs_all, function(p) {
+      A <- df[df[[annot_col]] %in% p$from, ]
+      B <- df[df[[annot_col]] %in% p$to,   ]
+      if (nrow(A) < MIN_CELLS || nrow(B) < MIN_CELLS) return(NULL)
+      data.frame(dist = nn_distance(A, B), pair = p$name,
+                 type = p$type, roi = rn, patient = patient)
+    }))
+  }))
+}))
+
+raw_all_new$pair <- factor(raw_all_new$pair, levels = all_order)
+raw_all_new$type <- factor(raw_all_new$type, levels = c("positive", "negative"))
+cat("Raw distances built.\n")
+
+## ============================================================
+## SHARED PLOT VARIABLES
+## ============================================================
+n_rois_ind <- dplyr::n_distinct(ind_df$roi[!is.na(ind_df$observed)])
+n_pts      <- dplyr::n_distinct(ind_df$patient[!is.na(ind_df$observed)])
+sub_ind    <- paste0("n = ", n_pts, " patients, ", n_rois_ind, " ROIs")
+
+## Stage progression data
+stage_prog <- stage_df %>%
+  dplyr::filter(pair %in% stage_seq_order, !is.na(observed)) %>%
+  dplyr::mutate(pair = factor(pair, levels = stage_seq_order))
+
+null_band <- stage_prog %>%
+  dplyr::group_by(pair) %>%
+  dplyr::summarise(
+    null_lo = median(null_median, na.rm = TRUE) * 0.8,
+    null_hi = median(null_median, na.rm = TRUE) * 1.2,
+    .groups = "drop") %>%
+  dplyr::mutate(pair = factor(pair, levels = stage_seq_order))
+
+## Heatmap annotation
+common_dist <- intersect(
+  rownames(tidyr::pivot_wider(
+    pairwise_summary_f %>% dplyr::filter(source %in% source_order_f,
+                                          target %in% source_order_f),
+    id_cols = source, names_from = target, values_from = median_dist) %>%
+    tibble::column_to_rownames("source")),
+  colnames(tidyr::pivot_wider(
+    pairwise_summary_f %>% dplyr::filter(source %in% source_order_f,
+                                          target %in% source_order_f),
+    id_cols = source, names_from = target, values_from = median_dist) %>%
+    tibble::column_to_rownames("source")))
+
+dist_matrix <- pairwise_summary_f %>%
+  dplyr::filter(source %in% source_order_f,
+                target %in% source_order_f) %>%
+  tidyr::pivot_wider(id_cols = source, names_from = target,
+                     values_from = median_dist) %>%
+  tibble::column_to_rownames("source")
+dist_matrix <- dist_matrix[intersect(rownames(dist_matrix),
+                                      colnames(dist_matrix)),
+                             intersect(rownames(dist_matrix),
+                                       colnames(dist_matrix))]
+
+zscore_matrix <- zscore_summary_f %>%
+  dplyr::filter(source %in% source_order_f,
+                target %in% source_order_f) %>%
+  tidyr::pivot_wider(id_cols = source, names_from = target,
+                     values_from = median_zscore) %>%
+  tibble::column_to_rownames("source")
+common_z      <- intersect(rownames(zscore_matrix), colnames(zscore_matrix))
+zscore_matrix <- zscore_matrix[common_z, common_z]
+
+stage_anno <- data.frame(
+  Stage = dplyr::recode(rownames(dist_matrix), !!!stage_map),
+  row.names = rownames(dist_matrix))
+stage_anno$Stage <- ifelse(is.na(stage_anno$Stage), "Other", stage_anno$Stage)
+stage_anno$Stage <- factor(stage_anno$Stage, levels = stage_order)
+
+stage_anno_z <- data.frame(
+  Stage = dplyr::recode(common_z, !!!stage_map),
+  row.names = common_z)
+stage_anno_z$Stage <- ifelse(is.na(stage_anno_z$Stage), "Other",
+                              stage_anno_z$Stage)
+stage_anno_z$Stage <- factor(stage_anno_z$Stage, levels = stage_order)
+
+anno_colours <- list(Stage = stage_colours)
+dist_cap     <- quantile(as.matrix(dist_matrix), 0.95, na.rm = TRUE)
+
+## Ranked z-score data
+pairs_of_interest <- c(
+  lapply(pairs_positive, function(p)
+    list(A = p$from, B = p$to, name = p$name, type = "positive")),
+  lapply(pairs_negative, function(p)
+    list(A = p$from, B = p$to, name = p$name, type = "negative"))
+)
+
+pair_zscores <- dplyr::bind_rows(lapply(pairs_of_interest, function(p) {
+  dplyr::bind_rows(lapply(p$A, function(a) {
+    dplyr::bind_rows(lapply(p$B, function(b) {
+      full_nhood_df %>%
+        dplyr::filter(source == a, target == b) %>%
+        dplyr::mutate(pair = p$name, type = p$type)
+    }))
+  }))
+}))
+
+pair_summary <- pair_zscores %>%
+  dplyr::group_by(pair, type) %>%
+  dplyr::summarise(median_zscore = median(zscore, na.rm = TRUE),
+                   .groups = "drop") %>%
+  dplyr::arrange(desc(median_zscore)) %>%
+  dplyr::mutate(pair = factor(pair, levels = pair),
+                type = factor(type, levels = c("positive", "negative")))
+
+## ============================================================
+## PLOTS
+## ============================================================
+
+## ---- Plot 1: Individual violin ----
+p1 <- ggplot(
+    raw_all_new %>% dplyr::filter(!is.na(dist), dist > 0),
+    aes(x = pair, y = dist, fill = type, colour = type)) +
+  geom_violin(trim = TRUE, alpha = 0.4, scale = "width") +
+  geom_boxplot(width = 0.12, outlier.shape = NA, alpha = 0.8,
+               colour = "black", fill = "white") +
+  geom_vline(xintercept = length(pos_order) + 0.5,
+             linetype = "dashed", colour = "grey30", linewidth = 1) +
+  scale_fill_manual(values = type_colours,
+                    labels = c("Adjacent (positive ctrl)",
+                               "Non-adjacent (negative ctrl)")) +
+  scale_colour_manual(values = type_colours,
+                      labels = c("Adjacent (positive ctrl)",
+                                 "Non-adjacent (negative ctrl)")) +
+  coord_cartesian(ylim = c(0, 1500)) +
+  annotate("rect", xmin = 0.5, xmax = length(pos_order) + 0.5,
+           ymin = 0, ymax = 1500, fill = "#2166AC", alpha = 0.03) +
+  annotate("rect", xmin = length(pos_order) + 0.5,
+           xmax = length(all_order) + 0.5,
+           ymin = 0, ymax = 1500, fill = "#B2182B", alpha = 0.03) +
+  annotate("text", x = length(pos_order)/2 + 0.5, y = 1420,
+           size = 5, fontface = "bold", colour = "#2166AC",
+           label = "← Adjacent developmental pairs") +
+  annotate("text", x = length(pos_order) + length(neg_order)/2 + 0.5,
+           y = 1420, size = 5, fontface = "bold", colour = "#B2182B",
+           label = "Non-adjacent pairs (controls) →") +
+  pub_theme() +
+  theme(legend.position = "bottom", legend.title = element_blank()) +
+  ylab("Nearest-neighbour distance (µm)") + xlab("") +
+  labs(title    = "Spatial adjacency: developmental pairs vs. negative controls",
+       subtitle = sub_ind)
+save_plot(p1, "plot1_individual_violin_v2", width = 26, height = 9)
+
+## ---- Plot 2: p-value heatmap — individual ----
+p2 <- ggplot(
+    ind_df %>% dplyr::filter(!is.na(p_value)),
+    aes(x = pair, y = patient, fill = p_value)) +
+  geom_tile(colour = "white", linewidth = 0.8) +
+  geom_text(aes(label = ifelse(is.na(p_value), "NA",
+                         ifelse(p_value < 0.001, "***",
+                         ifelse(p_value < 0.01,  "**",
+                         ifelse(p_value < 0.05,  "*",
+                                sprintf("%.2f", p_value)))))),
+            size = 5, colour = "white") +
+  geom_vline(xintercept = length(pos_order) + 0.5,
+             colour = "black", linewidth = 1.5) +
+  scale_fill_gradientn(
+    colours  = c("#08306B", "#2171B5", "#6BAED6", "#F7FBFF", "#FFFFFF"),
+    values   = c(0, 0.01, 0.05, 0.2, 1), limits = c(0, 1),
+    name = "p-value", na.value = "grey90") +
+  theme_classic(base_size = PUB_BASE) +
+  theme(axis.text.x  = element_text(angle = 45, hjust = 1, size = PUB_AXIS),
+        axis.text.y  = element_text(size = PUB_AXIS + 1),
+        legend.text  = element_text(size = PUB_LEGEND),
+        legend.title = element_text(size = PUB_LEGEND)) +
+  xlab("") + ylab("") +
+  labs(title    = "Permutation test p-values — individual pairs",
+       subtitle = "*** p<0.001  ** p<0.01  * p<0.05")
+save_plot(p2, "plot2_individual_pvalue_heatmap", width = 26, height = 7)
+
+## ---- Plot 3: Stage p-value heatmap ----
+p3 <- ggplot(
+    stage_df %>% dplyr::filter(!is.na(p_value)),
+    aes(x = pair, y = patient, fill = p_value)) +
+  geom_tile(colour = "white", linewidth = 1) +
+  geom_text(aes(label = ifelse(is.na(p_value), "NA",
+                         ifelse(p_value < 0.001, "***",
+                         ifelse(p_value < 0.01,  "**",
+                         ifelse(p_value < 0.05,  "*",
+                                sprintf("%.2f", p_value)))))),
+            size = 5, colour = "white") +
+  geom_vline(xintercept = 3.5, colour = "black", linewidth = 1.5) +
+  scale_fill_gradientn(
+    colours  = c("#08306B", "#2171B5", "#6BAED6", "#F7FBFF", "#FFFFFF"),
+    values   = c(0, 0.01, 0.05, 0.2, 1), limits = c(0, 1),
+    name = "p-value", na.value = "grey90") +
+  annotate("text", x = 2, y = n_pts + 0.8,
+           label = "← Sequential", colour = "#4DAF4A",
+           size = 5, fontface = "bold") +
+  annotate("text", x = 5, y = n_pts + 0.8,
+           label = "Skip controls →", colour = "#B2182B",
+           size = 5, fontface = "bold") +
+  theme_classic(base_size = PUB_BASE) +
+  theme(axis.text.x  = element_text(angle = 45, hjust = 1, size = PUB_AXIS),
+        axis.text.y  = element_text(size = PUB_AXIS + 1),
+        legend.text  = element_text(size = PUB_LEGEND),
+        legend.title = element_text(size = PUB_LEGEND)) +
+  xlab("") + ylab("") +
+  labs(title    = "Stage permutation test — 4-stage developmental axis",
+       subtitle = "*** p<0.001  ** p<0.01  * p<0.05 | ROIs pooled per patient")
+save_plot(p3, "plot3_stage_pvalue_heatmap", width = 14, height = 7)
+
+## ---- Plot 3b: Stage violin ----
+raw_stages <- dplyr::bind_rows(purrr::map(names(patient_map), function(patient) {
+  df_patient <- build_patient_df(patient)
+  dplyr::bind_rows(purrr::map(pairs_stages, function(p) {
+    A <- df_patient[df_patient[[annot_col]] %in% p$from, ]
+    B <- df_patient[df_patient[[annot_col]] %in% p$to,   ]
+    if (nrow(A) < MIN_CELLS || nrow(B) < MIN_CELLS) return(NULL)
+    data.frame(dist = nn_distance(A, B), pair = p$name,
+               type = p$type, patient = patient)
+  }))
+}))
+
+raw_stages$pair <- factor(raw_stages$pair, levels = stage_all_order)
+raw_stages$type <- factor(raw_stages$type, levels = c("sequential", "skip"))
+
+stage_type_colours <- c("sequential" = "#4DAF4A", "skip" = "#B2182B")
+
+p3b <- ggplot(
+    raw_stages %>% dplyr::filter(!is.na(dist), dist > 0),
+    aes(x = pair, y = dist, fill = type, colour = type)) +
+  geom_violin(trim = TRUE, alpha = 0.4, scale = "width") +
+  geom_boxplot(width = 0.12, outlier.shape = NA, alpha = 0.8,
+               colour = "black", fill = "white") +
+  geom_vline(xintercept = 3.5, linetype = "dashed",
+             colour = "grey30", linewidth = 1) +
+  scale_fill_manual(values   = stage_type_colours,
+                    labels   = c("Sequential stages", "Skip controls")) +
+  scale_colour_manual(values = stage_type_colours,
+                      labels = c("Sequential stages", "Skip controls")) +
+  coord_cartesian(ylim = c(0, 1500)) +
+  annotate("rect", xmin = 0.5, xmax = 3.5,
+           ymin = 0, ymax = 1500, fill = "#4DAF4A", alpha = 0.03) +
+  annotate("rect", xmin = 3.5, xmax = 6.5,
+           ymin = 0, ymax = 1500, fill = "#B2182B", alpha = 0.03) +
+  annotate("text", x = 2, y = 1420, size = 5, fontface = "bold",
+           colour = "#4DAF4A",
+           label = "← Sequential: Bud → Cap → Bell → Eruption") +
+  annotate("text", x = 5, y = 1420, size = 5, fontface = "bold",
+           colour = "#B2182B", label = "Skip controls →") +
+  pub_theme() +
+  theme(axis.text.x     = element_text(angle = 45, hjust = 1, size = PUB_AXIS),
+        legend.position = "bottom", legend.title = element_blank()) +
+  ylab("Nearest-neighbour distance (µm)") + xlab("") +
+  labs(title    = "Spatial adjacency — 4-stage developmental axis",
+       subtitle = paste0("n = ", n_pts, " patients (ROIs pooled)"))
+save_plot(p3b, "plot3_stage_violin", width = 14, height = 7)
+
+## ---- Plot 4: Stage progression ----
+p4 <- ggplot(stage_prog,
+             aes(x = pair, y = observed,
+                 group = patient, colour = patient)) +
+  geom_ribbon(data = null_band,
+              aes(x = pair, ymin = null_lo, ymax = null_hi, group = 1),
+              fill = "grey80", alpha = 0.4, inherit.aes = FALSE) +
+  geom_line(linewidth = 1.8, alpha = 0.85) +
+  geom_point(size = 6, alpha = 0.9) +
+  stat_summary(aes(group = 1), fun = median, geom = "line",
+               colour = "black", linewidth = 2.5, linetype = "dashed") +
+  stat_summary(aes(group = 1), fun = median, geom = "point",
+               colour = "black", size = 7, shape = 18) +
+  scale_colour_brewer(palette = "Set1", name = "Patient") +
+  theme_classic(base_size = PUB_BASE + 2) +
+  theme(axis.text.x     = element_text(size = PUB_AXIS + 2),
+        axis.text.y     = element_text(size = PUB_AXIS),
+        axis.title      = element_text(size = PUB_TITLE + 2),
+        legend.text     = element_text(size = PUB_LEGEND + 1),
+        legend.title    = element_text(size = PUB_LEGEND + 1),
+        legend.position = "right") +
+  ylab("Median NN distance (µm)") + xlab("") +
+  annotate("text", x = 2,
+           y = max(stage_prog$observed, na.rm = TRUE) * 1.08,
+           label = "Grey band = permuted null (±20%)",
+           size = 5, colour = "grey50") +
+  labs(title    = "Spatial progression — tooth developmental stages",
+       subtitle = "Bud → Cap → Bell → Eruption | dashed = cohort median")
+save_plot(p4, "plot4_stage_progression", width = 10, height = 8)
+
+## ---- Plot 5: Distance heatmap — capped purple_orange ----
+pal_po <- colorRampPalette(
+  c("#4B0082", "#1A1A2E", "#8B4500", "#E67E22"))(100)
+
+save_pheatmap(
+  mat      = as.matrix(dist_matrix),
+  name     = "plot5_distance_heatmap_capped_purple_orange",
+  colour   = pal_po,
+  breaks   = seq(0, dist_cap, length.out = 101),
+  anno     = stage_anno,
+  anno_col = anno_colours,
+  title    = paste0("Spatial NN distance — hierarchical clustering\n",
+                    "Colour capped at ", round(dist_cap, 0),
+                    "µm (95th percentile) | n = ", n_pts, " patients")
+)
+
+## ---- Plot 6: Z-score heatmap — non-linear scale ----
+z_min_val  <- min(as.matrix(zscore_matrix), na.rm = TRUE)
+z_max_val  <- max(as.matrix(zscore_matrix), na.rm = TRUE)
+brks_z     <- make_nonlinear_breaks(z_min_val, z_max_val, n = 101, power = 0.3)
+pal_zscore <- colorRampPalette(
+  c("#2166AC", "#4393C3", "#1A1A1A", "#F4A582", "#B2182B")
+)(length(brks_z) - 1)
+
+save_pheatmap(
+  mat      = as.matrix(zscore_matrix),
+  name     = "plot6_zscore_heatmap_hierarchical",
+  colour   = pal_zscore,
+  breaks   = brks_z,
+  anno     = stage_anno_z,
+  anno_col = anno_colours,
+  title    = paste0("Neighborhood enrichment z-score — hierarchical clustering\n",
+                    "Squidpy-equivalent k=", K_NHOOD,
+                    " | non-linear scale | n=", n_pts, " patients")
+)
+
+## ---- Plot 7: Density per patient ----
+p7 <- ggplot(
+    raw_all_new %>% dplyr::filter(!is.na(dist), dist > 0),
+    aes(x = dist, fill = patient)) +
+  geom_density(alpha = 0.4) +
+  facet_wrap(~ pair, scales = "free_y", ncol = 4) +
+  scale_fill_brewer(palette = "Set1", name = "Patient") +
+  pub_theme() +
+  theme(axis.text.x     = element_text(angle = 0, hjust = 0.5, size = 11),
+        legend.position = "bottom",
+        panel.spacing   = unit(1.2, "lines")) +
+  xlim(0, 500) +
+  xlab("Nearest-neighbour distance (µm)") + ylab("Density") +
+  labs(title    = "Distance distributions per patient — all pairs",
+       subtitle = sub_ind)
+save_plot(p7, "plot_density_per_patient_updated", width = 24, height = 20)
+
+## ---- Plot 8: Ranked z-score ----
+p8 <- ggplot(pair_summary,
+             aes(x = median_zscore, y = pair, fill = type)) +
+  geom_col(alpha = 0.8, width = 0.7) +
+  geom_vline(xintercept = 0, linetype = "dashed",
+             colour = "grey40", linewidth = 0.8) +
+  geom_vline(xintercept = c(-2, 2), linetype = "dotted",
+             colour = "grey60", linewidth = 0.5) +
+  scale_fill_manual(values = type_colours,
+                    labels = c("Adjacent", "Non-adjacent")) +
+  pub_theme() +
+  theme(axis.text.x        = element_text(angle = 0, hjust = 0.5,
+                                           size = PUB_AXIS),
+        axis.text.y        = element_text(size = PUB_AXIS),
+        legend.position    = "right",
+        legend.title       = element_blank(),
+        panel.grid.major.x = element_line(colour = "grey92", linewidth = 0.4)) +
+  xlab("Median neighborhood enrichment z-score") + ylab("") +
+  labs(title    = "Ranked spatial enrichment — all pairs",
+       subtitle = paste0("Squidpy-equivalent k=", K_NHOOD,
+                         " | ", N_PERM, " permutations | n=", n_pts, " patients"))
+save_plot(p8, "plot_ranked_zscore_updated", width = 12, height = 10)
+
+## ---- Individual plots — distance per cell type ----
+cat("\nGenerating individual distance plots...\n")
+for (src in source_order_f) {
+  plot_data <- pairwise_summary_f %>%
+    dplyr::filter(source == src) %>%
+    dplyr::arrange(median_dist) %>%
+    dplyr::mutate(target = factor(target, levels = target))
+  if (nrow(plot_data) == 0) next
+  src_stage <- ifelse(is.na(stage_map[src]), "Other", stage_map[src])
+  p <- ggplot(plot_data,
+              aes(x = target, y = median_dist, fill = target_stage)) +
+    geom_col(alpha = 0.8, width = 0.75) +
+    geom_errorbar(aes(ymin = pmax(0, median_dist - sd_dist),
+                      ymax = median_dist + sd_dist),
+                  width = 0.3, linewidth = 0.6, colour = "grey40") +
+    scale_fill_manual(values = stage_colours, name = "Stage", drop = FALSE) +
+    pub_theme() +
+    ylab("Median NN distance (µm)") + xlab("") +
+    labs(title    = paste0(src, "  [", src_stage, " stage]"),
+         subtitle = paste0("Ranked closest → furthest | n = ",
+                           dplyr::n_distinct(
+                             all_pairwise$patient[all_pairwise$source == src]),
+                           " patients"))
+  save_plot(p, paste0("distance_", gsub("[/ –]", "_", src)),
+            width = 14, height = 6)
+}
+cat("Individual distance plots done\n")
+
+## ---- Individual plots — z-score per cell type ----
+cat("\nGenerating individual z-score plots...\n")
+for (src in source_order_f) {
+  plot_summary <- zscore_summary_f %>%
+    dplyr::filter(source == src) %>%
+    dplyr::arrange(desc(median_zscore)) %>%
+    dplyr::mutate(target = factor(target, levels = target))
+  if (nrow(plot_summary) == 0) next
+  plot_patients <- full_nhood_f %>%
+    dplyr::filter(source == src,
+                  target %in% levels(plot_summary$target)) %>%
+    dplyr::mutate(target = factor(target, levels = levels(plot_summary$target)))
+  src_stage <- ifelse(is.na(stage_map[src]), "Other", stage_map[src])
+  p <- ggplot() +
+    geom_col(data = plot_summary,
+             aes(x = target, y = median_zscore, fill = target_stage),
+             alpha = 0.6, width = 0.75) +
+    geom_hline(yintercept = 0, linetype = "dashed",
+               colour = "grey30", linewidth = 0.8) +
+    geom_point(data = plot_patients,
+               aes(x = target, y = zscore, colour = patient),
+               size = 3, alpha = 0.9,
+               position = position_jitter(width = 0.15, seed = 42)) +
+    scale_fill_manual(values = stage_colours, name = "Stage", drop = FALSE) +
+    scale_colour_brewer(palette = "Set1", name = "Patient") +
+    pub_theme() +
+    ylab("Neighborhood enrichment z-score") + xlab("") +
+    labs(title    = paste0(src, "  [", src_stage, " stage]"),
+         subtitle = paste0("Bars = median | dots = individual patients | ",
+                           "k=", K_NHOOD, " | n = ",
+                           dplyr::n_distinct(plot_patients$patient),
+                           " patients"))
+  save_plot(p, paste0("zscore_k6_", gsub("[/ –]", "_", src)),
+            width = 15, height = 6)
+}
+cat("Individual z-score plots done\n")
+
+## ---- Combined landscape plots ----
+combined_dist <- pairwise_summary_f %>%
+  dplyr::filter(source %in% source_order_f) %>%
+  dplyr::mutate(source = factor(source, levels = source_order_f)) %>%
+  dplyr::group_by(source) %>%
+  dplyr::mutate(rank = rank(median_dist, ties.method = "first")) %>%
+  dplyr::ungroup()
+
+p_dist_comb <- ggplot(combined_dist,
+                       aes(x = rank, y = median_dist,
+                           colour = target_stage, size = target_stage)) +
+  geom_point(alpha = 0.85) +
+  geom_segment(aes(x = rank, xend = rank, y = 0, yend = median_dist,
+                   colour = target_stage), alpha = 0.25, linewidth = 0.5) +
+  facet_wrap(~ source, scales = "free_y", ncol = 5) +
+  scale_colour_manual(values = stage_colours, name = "Stage", drop = FALSE) +
+  scale_size_manual(values = c("Bud" = 3.5, "Cap" = 3.5, "Bell" = 3.5,
+                                "Eruption" = 3.5, "Other" = 2), guide = "none") +
+  theme_classic(base_size = PUB_BASE) +
+  theme(strip.text         = element_text(size = PUB_STRIP, face = "bold"),
+        strip.background   = element_rect(fill = "grey95", colour = NA),
+        legend.position    = "bottom",
+        axis.text.x        = element_blank(),
+        axis.ticks.x       = element_blank(),
+        axis.text.y        = element_text(size = 11),
+        axis.title         = element_text(size = PUB_TITLE),
+        legend.text        = element_text(size = PUB_LEGEND),
+        panel.grid.major.y = element_line(colour = "grey92", linewidth = 0.3),
+        panel.spacing      = unit(1, "lines")) +
+  guides(colour = guide_legend(override.aes = list(size = 5))) +
+  xlab("Cell types ranked closest → furthest") +
+  ylab("Median NN distance (µm)") +
+  labs(title    = "Unbiased spatial proximity landscape — NN distance",
+       subtitle = paste0("n = ", n_pts,
+                         " patients | ≥3 patients per cell type"))
+save_plot(p_dist_comb, "distance_landscape_combined", width = 26, height = 22)
+
+combined_zscore <- zscore_summary_f %>%
+  dplyr::filter(source %in% source_order_f) %>%
+  dplyr::mutate(source = factor(source, levels = source_order_f)) %>%
+  dplyr::group_by(source) %>%
+  dplyr::mutate(rank = rank(-median_zscore, ties.method = "first")) %>%
+  dplyr::ungroup()
+
+p_zscore_comb <- ggplot(combined_zscore,
+                         aes(x = rank, y = median_zscore,
+                             colour = target_stage, size = target_stage)) +
+  geom_hline(yintercept = 0, linetype = "dashed",
+             colour = "grey50", linewidth = 0.4) +
+  geom_point(alpha = 0.85) +
+  geom_segment(aes(x = rank, xend = rank, y = 0, yend = median_zscore,
+                   colour = target_stage), alpha = 0.25, linewidth = 0.5) +
+  facet_wrap(~ source, scales = "free_y", ncol = 5) +
+  scale_colour_manual(values = stage_colours, name = "Stage", drop = FALSE) +
+  scale_size_manual(values = c("Bud" = 3.5, "Cap" = 3.5, "Bell" = 3.5,
+                                "Eruption" = 3.5, "Other" = 2), guide = "none") +
+  theme_classic(base_size = PUB_BASE) +
+  theme(strip.text         = element_text(size = PUB_STRIP, face = "bold"),
+        strip.background   = element_rect(fill = "grey95", colour = NA),
+        legend.position    = "bottom",
+        axis.text.x        = element_blank(),
+        axis.ticks.x       = element_blank(),
+        axis.text.y        = element_text(size = 11),
+        axis.title         = element_text(size = PUB_TITLE),
+        legend.text        = element_text(size = PUB_LEGEND),
+        panel.grid.major.y = element_line(colour = "grey92", linewidth = 0.3),
+        panel.spacing      = unit(1, "lines")) +
+  guides(colour = guide_legend(override.aes = list(size = 5))) +
+  xlab("Cell types ranked most → least enriched") +
+  ylab("Median neighborhood enrichment z-score") +
+  labs(title    = paste0("Unbiased spatial neighborhood enrichment ",
+                          "(Squidpy-equivalent, k=", K_NHOOD, ")"),
+       subtitle = paste0("n = ", n_pts,
+                         " patients | ≥3 patients per cell type"))
+save_plot(p_zscore_comb, "zscore_landscape_full", width = 26, height = 22)
+
+## ============================================================
+## SESSION INFO
+## ============================================================
+sink(file.path(out_dir, "session_info.txt"))
+cat("ACP Spatial Adjacency Analysis v4.1 — Final\n")
+cat("Date:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
+cat("Parameters:\n")
+cat("  MIN_CELLS:", MIN_CELLS, "\n")
+cat("  N_PERM:   ", N_PERM,    "\n")
+cat("  K_NHOOD:  ", K_NHOOD,   "\n")
+cat("  SEED:     ", SEED,      "\n\n")
+print(sessionInfo())
+sink()
+cat("[Saved] session_info.txt\n")
+
+cat("\n=== ALL DONE ===\n")
+cat("Output:", normalizePath(out_dir), "\n\n")
+cat("Key output files:\n")
+key_files <- c(
+  "spatial_nn_individual_per_ROI.csv",
+  "spatial_nn_individual_per_patient.csv",
+  "spatial_nn_stages_per_patient.csv",
+  "all_pairwise_distances.csv",
+  "pairwise_distance_summary.csv",
+  "full_pairwise_zscore_k6_squidpy.csv",
+  "zscore_summary_k6_squidpy.csv",
+  "plot1_individual_violin_v2.pdf",
+  "plot2_individual_pvalue_heatmap.pdf",
+  "plot3_stage_pvalue_heatmap.pdf",
+  "plot3_stage_violin.pdf",
+  "plot4_stage_progression.pdf",
+  "plot5_distance_heatmap_capped_purple_orange.pdf",
+  "plot6_zscore_heatmap_hierarchical.pdf",
+  "plot_density_per_patient_updated.pdf",
+  "plot_ranked_zscore_updated.pdf",
+  "distance_landscape_combined.pdf",
+  "zscore_landscape_full.pdf"
+)
+for (f in key_files) {
+  exists <- file.exists(file.path(out_dir, f))
+  cat(ifelse(exists, "  ✓", "  ✗"), f, "\n")
+}
