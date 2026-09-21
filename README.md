@@ -8,6 +8,14 @@ This repository contains the analysis scripts for the single-cell RNA-seq
 subtyping, the CellChat ligand-receptor analysis, and the Squidpy-equivalent
 spatial neighborhood-enrichment analysis.
 
+ **Primary tumor scRNA-seq** (7 patients) to resolve the epithelial cell states
+  and map them onto dental and oral/gingival developmental references.
+- **Patient-derived organoids** (7 lines), including directed differentiation
+  toward ameloblast- and periodontal-ligament-like fates, to test whether
+  CTNNB1-mutant ACP cells retain this developmental potential.
+- **Xenium spatial transcriptomics** (5 tumors, 15 ROIs) to test whether the
+  cell states are spatially organized along the developmental axis.
+  
 ## Environment
 
 - R 4.6.1
