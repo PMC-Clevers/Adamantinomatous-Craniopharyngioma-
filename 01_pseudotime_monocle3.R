@@ -1,126 +1,95 @@
-## =============================================================================
-## 01_pseudotime_monocle3.R
-##
-## Build Monocle3 cell_data_set objects from annotated Seurat objects and
-## order cells in pseudotime from a specified root population.
-##
-## Input:  Seurat objects with a UMAP reduction and an `annotation` metadata
-##         column (e.g. oral_acp, dental_acp)
-## Output: cell_data_set objects with pseudotime assigned, saved to disk
-## =============================================================================
+################################################################################
+## pseudotime_monocle3.R
+## Monocle3 pseudotime on the dental-like ACP epithelium.
+## Root = Transitioning; branch = Transitioning -> Ameloblast lineage.
+## Stage-associated genes plotted over pseudotime (Figure 2G-I).
+################################################################################
 
-library(monocle3)
+library(Seurat)
 library(SeuratWrappers)
-library(SingleCellExperiment)
+library(monocle3)
 library(ggplot2)
+library(dplyr)
+library(RColorBrewer)
 
-## -----------------------------------------------------------------------
-## Helper: identify the principal graph node closest to a given root
-## population, used to seed order_cells()
-## -----------------------------------------------------------------------
-get_earliest_principal_node <- function(cds, root_cluster) {
-  cell_ids <- which(colData(cds)$annotation == root_cluster)
-  closest_vertex <- cds@principal_graph_aux[["UMAP"]]$pr_graph_cell_proj_closest_vertex
-  closest_vertex <- as.matrix(closest_vertex[colnames(cds), ])
-  root_pr_nodes <- igraph::V(principal_graph(cds)[["UMAP"]])$name[
-    as.numeric(names(which.max(table(closest_vertex[cell_ids, ]))))
-  ]
-  root_pr_nodes
+dental_acp <- readRDS("dental_acp.rds")   # dental-like epithelial subset
+
+## =============================================================================
+## 1. Seurat -> cell_data_set, carrying the existing UMAP and clusters
+## =============================================================================
+
+cds <- as.cell_data_set(dental_acp)
+cds <- estimate_size_factors(cds)                       # size-factor normalization
+rowData(cds)$gene_short_name <- rownames(cds)           # needed for gene plots
+
+## transfer Seurat UMAP + clustering into the cds
+reducedDims(cds)$UMAP <- Embeddings(dental_acp, "umap.rpca")
+cds@clusters$UMAP$clusters <- setNames(as.character(dental_acp$annotation),
+                                       colnames(dental_acp))
+cds@clusters$UMAP$partitions <- setNames(rep(1, ncol(cds)), colnames(cds))
+
+## =============================================================================
+## 2. Learn the principal graph and root in the Transitioning population
+## =============================================================================
+
+cds <- learn_graph(cds, use_partition = FALSE)
+
+## pick the root principal node where Transitioning cells are most enriched
+get_root_node <- function(cds, root_group, col = "annotation") {
+  cell_ids <- which(colData(cds)[[col]] == root_group)
+  vg <- igraph::V(principal_graph(cds)[["UMAP"]])$name
+  vertex_of_cell <- as.character(
+    cds@principal_graph_aux[["UMAP"]]$pr_graph_cell_proj_closest_vertex[, 1])
+  names(vertex_of_cell) <- colnames(cds)
+  tab <- table(vertex_of_cell[cell_ids])
+  vg[as.numeric(names(which.max(tab)))]
 }
+root_node <- get_root_node(cds, "Transitioning")
+cds <- order_cells(cds, root_pr_nodes = root_node)
 
-## -----------------------------------------------------------------------
-## Generic pipeline: Seurat object -> rooted, ordered cell_data_set
-##
-## reduction_slot_pattern: regex matching the UMAP reduction name in the
-##   Seurat object (varies between objects, e.g. "UMAP.DIM20" vs "umap1") -
-##   inspect reducedDimNames(cds) after the initial conversion if unsure.
-## -----------------------------------------------------------------------
-build_and_order_cds <- function(seurat_obj, root_population,
-                                 reduction_slot_pattern = "^UMAP") {
+## pseudotime + annotation UMAPs (Figure 2G, and coloured by cell type)
+plot_cells(cds, color_cells_by = "pseudotime", label_branch_points = FALSE,
+           label_leaves = FALSE, label_roots = FALSE) + ggtitle("Pseudotime")
+ggsave("pseudotime_UMAP.pdf", width = 6, height = 5)
 
-  cds <- as.cell_data_set(seurat_obj)
-  cds@clusters$UMAP$clusters <- seurat_obj$annotation
-
-  ## normalize whatever the UMAP reduction is named to "UMAP"
-  rd_names <- names(cds@int_colData@listData$reducedDims)
-  match_idx <- grepl(reduction_slot_pattern, rd_names)
-  if (!any(match_idx)) {
-    stop("No reducedDim name matched pattern '", reduction_slot_pattern,
-         "'. Available: ", paste(rd_names, collapse = ", "))
-  }
-  names(cds@int_colData@listData$reducedDims)[match_idx] <- "UMAP"
-
-  cds <- cluster_cells(cds, reduction_method = "UMAP")
-  cds <- learn_graph(cds, use_partition = FALSE)
-
-  cds <- order_cells(cds, root_pr_nodes = get_earliest_principal_node(cds, root_population))
-
-  cds
-}
+plot_cells(cds, color_cells_by = "annotation", label_cell_groups = FALSE) +
+  ggtitle("Annotation")
+ggsave("pseudotime_annotation_UMAP.pdf", width = 7, height = 5)
 
 ## =============================================================================
-## Example usage - Oral
+## 3. Branch selection: Transitioning -> Ameloblast lineage
+##    Interactive (choose the branch on the graph):
+##      cds_branch <- choose_graph_segments(cds)
+##    Reproducible alternative: restrict to the populations on this branch.
 ## =============================================================================
 
-oral_acp <- readRDS("oral_acp_with_pseudotime_early_oral_root.rds")
-
-oral_cds <- build_and_order_cds(
-  oral_acp,
-  root_population = "Early-Oral epithelium",
-  reduction_slot_pattern = "^UMAP"   # e.g. matches "UMAP.DIM20"
-)
-
-plot_cells(oral_cds, color_cells_by = "pseudotime", label_cell_groups = FALSE,
-           label_leaves = FALSE, label_branch_points = FALSE, graph_label_size = 3)
-ggsave("output/pseudotime_oral_early_oral_root.pdf", width = 7, height = 6)
-
-oral_acp$pseudotime <- pseudotime(oral_cds)
-saveRDS(oral_acp, "oral_acp_with_pseudotime_early_oral_root.rds")
-saveRDS(oral_cds, "oral_cds_monocle3.rds")
+branch_labels <- c("Transitioning","Dental Epithelium","OEE/SR","IEE",
+                   "Pre-ameloblast","Ameloblast")   # CONFIRM against your annotation
+cds_branch <- cds[, colData(cds)$annotation %in% branch_labels]
 
 ## =============================================================================
-## Example usage - Dental
+## 4. Genes varying along the trajectory (graph_test)
 ## =============================================================================
 
-dental_acp <- readRDS("dental_acp_with_pseudotime_transitioning_root.rds")
+graph_res <- graph_test(cds, neighbor_graph = "principal_graph", cores = 4)
+graph_res <- graph_res[order(-graph_res$morans_I), ]
+write.csv(graph_res, "pseudotime_graphtest_genes.csv")
 
-## check available root populations first
-table(dental_acp$annotation)
+## =============================================================================
+## 5. Stage-associated genes over pseudotime (Figure 2H-I)
+##    Order kept as: early -> intermediate -> late (do not reorder).
+## =============================================================================
 
-dental_cds <- build_and_order_cds(
-  dental_acp,
-  root_population = "Transitioning",
-  reduction_slot_pattern = "^UMAP"
-)
+stage_genes <- c("KRT15","PAPPA","SPINK5",     # early
+                 "SOX6","SCUBE3","DLX5",        # intermediate
+                 "SP6","KIF5C","VWDE","KRT17")  # late
 
-plot_cells(dental_cds, color_cells_by = "pseudotime", label_cell_groups = FALSE,
-           label_leaves = FALSE, label_branch_points = FALSE, graph_label_size = 3)
-ggsave("output/pseudotime_dental_transitioning_root.pdf", width = 7, height = 6)
+plot_genes_in_pseudotime(
+  cds_branch[stage_genes, ],
+  color_cells_by = "annotation",
+  min_expr = 0.5,
+  ncol = 2
+) + scale_color_manual(values = brewer.pal(max(3, length(branch_labels)), "Set2"))
+ggsave("dental_Transitioning_to_Amelo_genes_over_pseudotime.pdf", width = 8, height = 12)
 
-dental_acp$pseudotime <- pseudotime(dental_cds)
-saveRDS(dental_acp, "dental_acp_with_pseudotime_transitioning_root.rds")
-saveRDS(dental_cds, "dental_cds_monocle3.rds")
-
-## -----------------------------------------------------------------------
-## NOTE on re-rooting an existing branch object
-## -----------------------------------------------------------------------
-## order_cells() recomputes pseudotime as geodesic distance along the
-## EXISTING principal graph from a new root - it does not rebuild the graph
-## itself. If a cds has been re-rooted multiple times across a session,
-## rebuild it fresh (cluster_cells() + learn_graph()) from a saved,
-## known-good state before re-rooting again, rather than repeatedly
-## re-rooting the same live object. Confirm the result with:
-##   summary(pseudotime(cds))
-##   plot_cells(cds, color_cells_by = "pseudotime", ...)
-## before proceeding to downstream analysis.
-
-## -----------------------------------------------------------------------
-## NOTE on annotation changes during revision
-## -----------------------------------------------------------------------
-## If a population's annotation is refined or relabeled during revision
-## (e.g. based on additional marker validation), document:
-##   (1) the specific markers/evidence supporting the change
-##   (2) that the change is applied consistently across all downstream
-##       figures/tables, not just the one a reviewer commented on
-## Do not choose a root population based on which choice produces a more
-## favorable-looking trajectory result.
+saveRDS(cds, "dental_acp_monocle3_cds.rds")
