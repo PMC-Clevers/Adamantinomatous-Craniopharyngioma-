@@ -8,7 +8,7 @@ This repository contains the analysis scripts for the single-cell RNA-seq
 subtyping, the CellChat ligand-receptor analysis, and the Squidpy-equivalent
 spatial neighborhood-enrichment analysis.
 
- **Primary tumor scRNA-seq** (7 patients) to resolve the epithelial cell states
+ - **Primary tumor scRNA-seq** (7 patients) to resolve the epithelial cell states
   and map them onto dental and oral/gingival developmental references.
 - **Patient-derived organoids** (7 lines), including directed differentiation
   toward ameloblast- and periodontal-ligament-like fates, to test whether
