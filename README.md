@@ -153,7 +153,7 @@ Results are saved to `results/spatial_adjacency_v4/`.
 
 | Patient | Xenium profiling | ROIs | Notes |
 |---------|-----------------|------|-------|
-| ACP004  | Whole slide (BT288) | 1 | 401,841 cells |
+| ACP004  | Whole slide (BT288) | 2 |  |
 | ACP005  | TMA | 2 | |
 | ACP006  | TMA | 3 | |
 | ACP007  | TMA | 7 | |
