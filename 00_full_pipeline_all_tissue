@@ -4,18 +4,12 @@
 ##
 ## Per-lane load + QC -> SoupOrCell genotype demultiplexing -> merge ->
 ## full integration/coarse annotation -> primary-tissue subset ->
-## epithelial (immune-removed) subset -> dental / oral(gingival) compartments.
+## epithelial (immune-removed) subset -> dental / oral(gingival) compartments ->
+## per-compartment subclustering + annotation + marker dot plots.--> immune subset
 ##
-## Key point: the immune-removed subset is re-integrated FRESH, with
-## FindNeighbors AND RunUMAP both on that same fresh integrated.rpca reduction
-## (no inherited / mismatched embedding).
-##
-## Note: intra-genotype doublets were NOT separately assessed (scDblFinder was
-## not run); inter-patient doublets are removed by SoupOrCell below. This is
-## stated as a limitation in the Methods.
-##
-## Spots marked CONFIRM are run-specific (QC thresholds, genotype->sample map,
-## cluster IDs, compartment labels) and must be set from your own outputs.
+## Only the immune/endothelial and glial cluster IDs (Section 8) are run-specific
+## and must be read off the marker FeaturePlots; everything else (compartment
+## labels, subcluster parameters, annotation maps, marker sets) is filled in.
 ################################################################################
 
 library(Seurat)          # v5.5.1
@@ -23,14 +17,12 @@ library(SeuratWrappers)
 library(ggplot2)
 library(dplyr)
 library(patchwork)
+library(scCustomize)
 options(future.globals.maxSize = 60 * 1024^3)
 
 ## =============================================================================
 ## 1. Load the multiplexed 10x lanes
-##    Each lane (LX321/LX374/LX734/LX777) pools several patient primary/organoid
-##    samples that are separated afterwards by SoupOrCell SNP genotype.
 ## =============================================================================
-
 so_acp1 <- CreateSeuratObject(Read10X("LX321/filtered_feature_bc_matrix/"), project = "acp1")
 so_acp2 <- CreateSeuratObject(Read10X("LX374/filtered_feature_bc_matrix/"), project = "acp2")
 so_acp3 <- CreateSeuratObject(Read10X("LX734/filtered_feature_bc_matrix/"), project = "acp3")
@@ -39,7 +31,6 @@ so_acp4 <- CreateSeuratObject(Read10X("LX777/filtered_feature_bc_matrix/"), proj
 ## =============================================================================
 ## 2. QC metrics and per-lane filtering (percent.mt cutoff tuned per lane)
 ## =============================================================================
-
 for (obj in c("so_acp1","so_acp2","so_acp3","so_acp4"))
   assign(obj, `[[<-`(get(obj), "percent.mt", value = PercentageFeatureSet(get(obj), pattern = "^MT-")))
 
@@ -48,7 +39,6 @@ VlnPlot(so_acp2, features = c("nFeature_RNA","nCount_RNA","percent.mt"), ncol = 
 VlnPlot(so_acp3, features = c("nFeature_RNA","nCount_RNA","percent.mt"), ncol = 3)
 VlnPlot(so_acp4, features = c("nFeature_RNA","nCount_RNA","percent.mt"), ncol = 3)
 
-# CONFIRM per-lane thresholds from the violin plots (percent.mt differs per lane)
 so_acp1 <- subset(so_acp1, subset = nFeature_RNA > 200 & nFeature_RNA < 8000 & percent.mt < 20)
 so_acp2 <- subset(so_acp2, subset = nFeature_RNA > 200 & nFeature_RNA < 8000 & percent.mt < 30)
 so_acp3 <- subset(so_acp3, subset = nFeature_RNA > 200 & nFeature_RNA < 8000 & percent.mt < 25)
@@ -56,11 +46,7 @@ so_acp4 <- subset(so_acp4, subset = nFeature_RNA > 200 & nFeature_RNA < 8000 & p
 
 ## =============================================================================
 ## 3. SoupOrCell genotype demultiplexing
-##    Assign each cell a genotype cluster from its SNP profile (singlet ->
-##    assignment; otherwise "doublet"/"unassigned"), then map the numeric
-##    genotype cluster to the known sample identity for that lane.
 ## =============================================================================
-
 soc1 <- read.delim("acp1clusters.tsv")
 soc2 <- read.delim("acp2clusters.tsv")
 soc3 <- read.delim("LX734/filtered_feature_bc_matrix/clusters.tsv")
@@ -76,17 +62,15 @@ so_acp2 <- AddMetaData(so_acp2, make_genotype(soc2), col.name = "genotype")
 so_acp3 <- AddMetaData(so_acp3, make_genotype(soc3), col.name = "genotype")
 so_acp4 <- AddMetaData(so_acp4, make_genotype(soc4), col.name = "genotype")
 
-## CONFIRM: map SoupOrCell numeric genotype cluster -> sample id, per lane.
-## (each lane's numeric clusters correspond to specific BT### primary/organoid
-##  samples, determined from known pooling + optional SNP concordance)
-map1 <- c("0" = "BT###_P", "1" = "BT###_P")   # lane LX321
+## map SoupOrCell numeric genotype cluster -> sample id, per lane (run-specific)
+map1 <- c("0" = "BT###_P", "1" = "BT###_P")    # lane LX321
 map2 <- c("0" = "BT###_P", "1" = "BT###_Org")  # lane LX374
 map3 <- c("0" = "BT###_P", "1" = "BT###_Org")  # lane LX734
 map4 <- c("0" = "BT###_P", "1" = "BT###_Org")  # lane LX777
 
 assign_sample <- function(obj, m) {
   ts <- m[as.character(obj$genotype)]
-  ts[is.na(ts)] <- obj$genotype[is.na(ts)]   # keep doublet/unassigned labels
+  ts[is.na(ts)] <- obj$genotype[is.na(ts)]
   AddMetaData(obj, ts, col.name = "test_genotype")
 }
 so_acp1 <- assign_sample(so_acp1, map1)
@@ -94,7 +78,6 @@ so_acp2 <- assign_sample(so_acp2, map2)
 so_acp3 <- assign_sample(so_acp3, map3)
 so_acp4 <- assign_sample(so_acp4, map4)
 
-## remove inter-patient doublets and unassigned cells
 drop <- c("doublet", "unassigned")
 so_acp1 <- subset(so_acp1, subset = !(genotype %in% drop))
 so_acp2 <- subset(so_acp2, subset = !(genotype %in% drop))
@@ -102,17 +85,15 @@ so_acp3 <- subset(so_acp3, subset = !(genotype %in% drop))
 so_acp4 <- subset(so_acp4, subset = !(genotype %in% drop))
 
 ## =============================================================================
-## 4. Merge lanes into the full object
+## 4. Merge lanes
 ## =============================================================================
-
 acp <- merge(so_acp1, y = c(so_acp2, so_acp3, so_acp4),
              add.cell.ids = c("acp1","acp2","acp3","acp4"))
 acp[["RNA"]] <- JoinLayers(acp[["RNA"]])
 
 ## =============================================================================
-## 5. Integrate the full object and coarse-annotate (flag non-epithelial)
+## 5. Integrate full object and coarse-annotate (flag non-epithelial)
 ## =============================================================================
-
 acp[["RNA"]] <- split(acp[["RNA"]], f = acp$test_genotype)
 acp <- SCTransform(acp, conserve.memory = TRUE)
 acp <- RunPCA(acp)
@@ -134,7 +115,6 @@ FeaturePlot(acp, reduction = "umap.harmony",
 ## =============================================================================
 ## 6. Split into primary tissue and organoids
 ## =============================================================================
-
 all_prim <- subset(acp, subset = test_genotype %in%
   c("BT288_P","BT322_P","BT325_P","BT155_P","BT506_P","BT259_P","BT154_P"))
 all_orgs <- subset(acp, subset = test_genotype %in%
@@ -143,7 +123,6 @@ all_orgs <- subset(acp, subset = test_genotype %in%
 ## =============================================================================
 ## 7. Re-integrate the primary-tissue subset
 ## =============================================================================
-
 all_prim[["RNA"]] <- JoinLayers(all_prim[["RNA"]])
 all_prim[["RNA"]] <- split(all_prim[["RNA"]], f = all_prim$test_genotype)
 all_prim <- SCTransform(all_prim, conserve.memory = TRUE)
@@ -154,27 +133,31 @@ all_prim <- IntegrateLayers(all_prim, method = RPCAIntegration, orig.reduction =
                             new.reduction = "integrated.rpca100", dims = 1:30,
                             normalization.method = "SCT", k.weight = 30, verbose = TRUE)
 all_prim[["RNA"]] <- JoinLayers(all_prim[["RNA"]])
-
 all_prim <- FindNeighbors(all_prim, reduction = "integrated.rpca100", dims = 1:20)
 all_prim <- FindClusters(all_prim, resolution = 0.6, cluster.name = "rpca_clusters100")
 all_prim <- RunUMAP(all_prim, reduction = "integrated.rpca100", dims = 1:20,
                     min.dist = 0.1, reduction.name = "umap.rpca2")
-
 Idents(all_prim) <- "rpca_clusters100"
 DimPlot(all_prim, label = TRUE, reduction = "umap.rpca2")
+saveRDS(all_prim, "all_prim_scRNAseq_SCT_PCA_UMAPrpca2_clusters.rds")
+
+## Coarse Figure-1B dot plot (markers used to call compartments + non-epithelial)
+fig1b_markers <- c(
+  "DKK4","AXIN2","NOTUM","ITGA1","HUNK","GAD1",          # Cluster cells
+  "SPINK5","PAPPA","EHF","CXCL14","IRX1",                # oral / early oral
+  "PTPRC","MS4A1","CD3D","CD8A","CD68","CD163","FCN1",   # immune
+  "EMCN","PDGFRA","OLIG1","EPCAM"                        # endothelial / fibro-glial / epithelial
+)
 FeaturePlot(all_prim, reduction = "umap.rpca2",
             features = c("PTPRC","CD3D","MS4A1","CD163","FCN1","PDGFRA","EMCN","OLIG1"))
-saveRDS(all_prim, "all_prim_scRNAseq_SCT_PCA_UMAPrpca2_clusters.rds")
+DotPlot_scCustom(all_prim, features = fig1b_markers, group.by = "rpca_clusters100") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
 ## =============================================================================
 ## 8. Remove non-epithelial cells in two passes, re-integrating fresh each time.
-##    Pass 1: remove immune + endothelial clusters, then re-integrate/re-cluster.
-##    Pass 2: on the re-clustering, glial cells separate into their own cluster;
-##            remove that, then re-integrate/re-cluster again -> clean epithelium.
-##    (each re-clustering runs FindNeighbors AND RunUMAP on the same fresh
-##     integrated.rpca, so identities and embedding are in the same space)
+##    Pass 1: remove immune + endothelial clusters -> re-integrate/re-cluster.
+##    Pass 2: glial cells then separate into their own cluster -> remove -> re-integrate.
 ## =============================================================================
-
 reintegrate <- function(obj, dims = 1:20, res = 0.7, umap_name = "umap.rpca") {
   obj[["RNA"]] <- JoinLayers(obj[["RNA"]])
   obj[["RNA"]] <- split(obj[["RNA"]], f = obj$test_genotype)
@@ -192,23 +175,21 @@ reintegrate <- function(obj, dims = 1:20, res = 0.7, umap_name = "umap.rpca") {
 }
 
 ## --- Pass 1: remove immune + endothelial clusters ---
-# CONFIRM immune + endothelial cluster IDs from the FeaturePlot above (PTPRC/CD3D/
-# MS4A1/CD163/FCN1 = immune; EMCN = endothelial)
-immune_endo_clusters <- c(/* immune + endothelial cluster IDs */)
+## read these off the FeaturePlot/DotPlot above:
+##   immune  = PTPRC / CD3D / MS4A1 / CD163 / FCN1 high
+##   endothelial = EMCN high
+immune_endo_clusters <- c()   # <- set the immune + endothelial cluster numbers
 all_prim_epi <- subset(all_prim, idents = immune_endo_clusters, invert = TRUE)
 all_prim_epi <- reintegrate(all_prim_epi)
 
 DimPlot(all_prim_epi, reduction = "umap.rpca", label = TRUE)
-# glial cells (OLIG1/S100B) now form their own cluster in this re-clustering
 FeaturePlot(all_prim_epi, reduction = "umap.rpca",
             features = c("OLIG1","S100B","PTPRC","EMCN","PDGFRA"))
 
-## --- Pass 2: remove the glial cluster ---
-# CONFIRM the glial cluster ID from the plot above
-glial_cluster <- c(/* glial cluster ID */)
+## --- Pass 2: glial cluster (OLIG1 / S100B) now separates -> remove it ---
+glial_cluster <- c()          # <- set the glial cluster number from the plot above
 all_prim_noimmune <- subset(all_prim_epi, idents = glial_cluster, invert = TRUE)
 all_prim_noimmune <- reintegrate(all_prim_noimmune)
-ncol(all_prim_noimmune)
 
 DimPlot(all_prim_noimmune, reduction = "umap.rpca", label = TRUE)
 FeaturePlot(all_prim_noimmune, reduction = "umap.rpca",
@@ -221,16 +202,265 @@ write.csv(all_prim_noimmune.markers, "all_prim_noimmune_markers.csv")
 saveRDS(all_prim_noimmune, "all_prim_noimmune_rpca_FINAL.rds")
 
 ## =============================================================================
-## 9. Split epithelium into dental and oral/gingival compartments
-##    (subset from the clean, fresh-integrated all_prim_noimmune)
+## 9. Coarse epithelial annotation (annotation_noimmune_v1) and compartment split
 ## =============================================================================
+## Coarse epithelial labels on the clean object; set the cluster->label map from
+## the marker dot plot (dental markers vs oral/gingival markers).
+Idents(all_prim_noimmune) <- "rpca_clusters"
 
-# CONFIRM which annotated populations define each compartment
-dental_labels <- c(/* dental-like epithelial annotations */)
-oral_labels   <- c(/* oral/gingival-like epithelial annotations */)
 
-dental_acp <- subset(all_prim_noimmune, subset = annotation %in% dental_labels)  # ~8,277 cells
-oral_acp   <- subset(all_prim_noimmune, subset = annotation %in% oral_labels)    # ~24,493 cells
+dental_acp <- subset(all_prim,idents = c(3,7,11,10,14,13,18 ) )
+oral_acp <- subset(all_prim,idents = c(5,4,6,9,8, 15,0,1,2) )
 
 saveRDS(dental_acp, "dental_acp.rds")
 saveRDS(oral_acp,   "oral_acp.rds")
+
+## =============================================================================
+## 10. DENTAL compartment: subcluster -> remove low quality -> annotate
+## =============================================================================
+dental_acp <- SCTransform(dental_acp)
+dental_acp <- RunPCA(dental_acp)
+dental_acp <- FindNeighbors(dental_acp, reduction = "integrated.rpca100", dims = 1:15, nn.eps = 0.5)
+dental_acp <- FindClusters(dental_acp, resolution = 0.6, n.start = 10)
+dental_acp <- RunUMAP(dental_acp, reduction = "integrated.rpca100", dims = 1:15,
+                      min.dist = 0.5, reduction.name = "umap.rpca")
+DimPlot(dental_acp, reduction = "umap.rpca", label = TRUE)
+
+dental_acp <- PrepSCTFindMarkers(dental_acp)
+dental_markers <- FindAllMarkers(dental_acp, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.5)
+write.csv(dental_markers, "dental_acp_markers.csv")
+
+## optional: drop a residual low-quality subcluster if one appears (set the ID)
+# dental_acp <- subset(dental_acp, idents = c(), invert = TRUE)
+
+## finer dental annotation (set from dental_markers / the dot plot below)
+dental_annotation <- c(
+  "0"  = "OEE/SI",
+  "1"  = "Transitioning",
+  "2"  = "HERS-like",
+  "3"  = "Dental Epithelium",
+  "4"  = "OEE/SI",
+  "5"  = "OEE/SR(KRT6+)",
+  "6"  = "Cluster Cells",
+  "7"  = "Ameloblast",
+  "8"  = "Cervical Loop",
+  "9"  = "PDL-like",
+  "10" = "IEE"
+)
+dental_acp$annotation <- plyr::mapvalues(
+  x = as.character(Idents(dental_acp)),
+  from = names(dental_annotation), to = unname(dental_annotation))
+Idents(dental_acp) <- "annotation"
+
+## dental marker dot plot (annotated groups)
+dental_marker_genes <- c(
+  "DKK4","AXIN2","HUNK",                 # Cluster Cells
+  "SPINK5","PAPPA",                      # early oral / transitioning
+  "RIMS2","SOX6",                        # OEE
+  "KRT6C","KRT6B",                       # KRT6+ SR
+  "KRT14","KRT15","KRT17","DLX5",        # Dental Epithelium
+  "CHGB","LGR6","FRZB","LEF1","VCAN",    # Cervical Loop / OEE
+  "FBN2","AFF3","TBX1",                  # OEE/SI
+  "HMGA2","SMAD3","PIEZO2","LAMC1",      # HERS-like
+  "COL3A1","POSTN","TAGLN","VIM",        # PDL-like
+  "UNC5C","ETV5",                        # IEE
+  "AMBN","VWDE","SP6","KIF5C"            # Ameloblast
+)
+DotPlot_scCustom(dental_acp, features = dental_marker_genes, group.by = "annotation") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+saveRDS(dental_acp, "dental_acp_annotated.rds")
+
+## =============================================================================
+## 11. ORAL / gingival compartment: subcluster -> remove low quality -> annotate
+## =============================================================================
+oral_acp <- SCTransform(oral_acp)
+oral_acp <- RunPCA(oral_acp)
+oral_acp <- FindNeighbors(oral_acp, reduction = "integrated.rpca100", dims = 1:20, nn.eps = 0.5)
+oral_acp <- FindClusters(oral_acp, resolution = 0.6, n.start = 10)
+oral_acp <- RunUMAP(oral_acp, reduction = "integrated.rpca100", dims = 1:20,
+                    min.dist = 0.5, reduction.name = "umap.dim20")
+DimPlot(oral_acp, reduction = "umap.dim20", label = TRUE)
+
+oral_acp <- PrepSCTFindMarkers(oral_acp)
+oral_markers <- FindAllMarkers(oral_acp, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.5)
+write.csv(oral_markers, "oral_acp_markers.csv")
+
+## remove the low-quality subcluster (cluster 9)
+oral_acp <- subset(oral_acp, idents = "9", invert = TRUE)
+
+## finer oral/gingival annotation (set from oral_markers / the dot plot below)
+oral_annotation <- c(
+  "0"  = "Basal progenitors",
+  "1"  = "Oral epithelium",
+  "2"  = "Mesenchymal-like",
+  "3"  = "Pre-Mesenchymal-like",
+  "4"  = "Junction Basal/Keratinocyte",
+  "5"  = "CCL2+ Keratinocyte",
+  "6"  = "Intermediate Sulcus",
+  "7"  = "Early-Oral epithelium",
+  "8"  = "Sulcus basal",
+  "9"  = "Mesenchymal-like",
+  "10" = "Stress",
+  "11" = "Sulcus Keratinocyte",
+  "12" = "CCL2+ Keratinocyte"
+)
+oral_acp$annotation <- plyr::mapvalues(
+  x = as.character(Idents(oral_acp)),
+  from = names(oral_annotation), to = unname(oral_annotation))
+Idents(oral_acp) <- "annotation"
+
+## oral marker dot plot (annotated groups)
+oral_marker_genes <- c(
+  "HOPX","SPINK5","EHF","KRT14","TP63","SFRP1",   # early oral epithelium
+  "ODAM","KRT7","AMTN","GJB6",                    # junctional
+  "TACSTD2","PROCR","CD24","GJA1",                # basal
+  "KRT16","KRT13","KRT6C","AQP3",                 # sulcus
+  "CCL2","CXCL1","CXCL8",                         # CCL2+ inflamed
+  "MOXD1","COL19A1","LY75"                        # mesenchymal-like
+)
+DotPlot_scCustom(oral_acp, features = oral_marker_genes, group.by = "annotation") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+saveRDS(oral_acp, "oral_acp_annotated.rds")
+
+## =============================================================================
+## 12. Compartment-level (Dental vs Oral) differential expression (optional)
+## =============================================================================
+Idents(all_prim_noimmune) <- "compartment"
+compartment_markers <- FindMarkers(all_prim_noimmune, ident.1 = "Dental", ident.2 = "Oral",
+                                   min.pct = 0.1, logfc.threshold = 0.25)
+write.csv(compartment_markers, "dental_vs_oral_compartment_markers.csv")
+
+## =============================================================================
+## 13. Immune subset
+## =============================================================================
+
+## In the immune subset: label the junk clusters, then exclude
+## cluster 5 = neural/mesenchymal contaminant, cluster 1 = Unknown
+## (adjust numbers to your actual clusters)
+
+## Option A — drop them from the immune subset entirely before merging labels back -- epithelialcells with ptprc expression 
+immune_filt <- subset(immune_filt,
+                      subset = !(seurat_clusters %in% c("5")))
+
+## Then when you merge labels back, those cells simply keep their original
+## coarse (non-immune) identity in the full object — they won't be counted as immune.
+
+all_prim_cc <- subset(all_prim, subset = !is.na(finer_annotation) &
+                        finer_annotation != "")
+all_prim_cc$finer_annotation <- droplevels(factor(all_prim_cc$finer_annotation))
+print(table(all_prim_cc$finer_annotation))   # confirm both junk clusters gone
+
+
+## In the immune subset — rename to disambiguate from old coarse labels
+## e.g. B-cells -> "B/Plasma cells"
+immune_filt$cell_type[immune_filt$cell_type == "B-cells"] <- "B/Plasma cells"
+
+library(Seurat)
+library(scCustomize)
+
+Idents(immune_clean) <- "seurat_clusters"
+
+## canonical markers grouped by lineage (incl. pDC + IDO1-DC that are new)
+markers <- c(
+  "PTPRC",                                              # pan-immune
+  "CD68","CSF1R","LYZ","C1QA","C1QB","APOE","TREM2",    # macrophage
+  "MARCO","MMP9","ACP5","GPNMB","ADAMDEC1",             # TAM
+  "MAFB","SLC40A1","CPM",                               # M2
+  "CCL2","CCL3","CCL4","CH25H",                         # M1
+  "S100A8","S100A9","FCN1","VCAN",                      # mono/neutro
+  "FCER1A","CD1C","CLEC10A","FLT3",                     # cDC2
+  "IDO1","DNASE1L3","CLNK",                             # IDO1/mregDC
+  "LILRA4","CLEC4C","PTGDS",                            # pDC
+  "CD3D","CD3E","IL7R",                                 # pan-T
+  "CD8A","CD8B","GZMK","NKG7","IFNG",                   # CD8
+  "FOXP3","CTLA4","TIGIT","TNFRSF18",                   # Treg
+  "MS4A1","CD79A","MZB1","JCHAIN")                      # B/plasma
+markers <- markers[markers %in% rownames(immune_clean)]
+
+Clustered_DotPlot(immune_clean, features = markers)
+ggsave(paste0("immune_newclusters_annotation_dotplot_",
+              format(Sys.Date(),"%Y%m%d"), ".pdf"), width = 16, height = 6)
+
+
+
+new_labels <- c(
+  "0"  = "cDC2",
+  "1"  = "Macrophage M2",          # ambiguous — see note
+  "2"  = "CD4+ T",
+  "3"  = "Macrophage M2",
+  "4"  = "Macrophage M1",
+  "6"  = "Monocytes/Neutrophils",
+  "7"  = "CD8+ T",
+  "8"  = "TAM",
+  "9"  = "Tregs",
+  "10" = "B/Plasma cells")
+dents(immune_clean) <- "seurat_clusters"
+immune_clean <- RenameIdents(immune_clean, new_labels)
+immune_clean$cell_type <- as.character(Idents(immune_clean))
+cat("Final immune annotation:\n")
+print(table(immune_clean$cell_type))
+
+## ---- Confirmatory dotplot with your label order ----
+genes <- c("CCL4","CCL3","FCGR1A","CCL2","CH25H","EGR2","MAFB",
+           "TREM2","C1QA","C1QB","C1QC","APOE","LYZ",
+           "S100A12","S100A9","VCAN","S100A8","FCN1",
+           "FLT3","FCER1A","CD1C","CLEC10A",
+           "CD4","ACP5","MMP9","ADAMDEC1","MARCO","GPNMB","CD68","PTPRC",
+           "STAT4","BCL11B","CD247","CD3D","CD3E","ICOS","IL7R",
+           "FOXP3","TNFRSF18","IKZF2","CTLA4","TIGIT",
+           "MS4A1","NKG7","GZMK","GZMA","CCL5","GZMH","CD8B","IFNG","CD8A",
+           "CD79A","MZB1","JCHAIN","DERL3")
+genes <- genes[genes %in% rownames(immune_clean)]
+
+ct_order <- c("TAM","Monocytes/Neutrophils","cDC2","Macrophage M1",
+              "Macrophage M2","CD8+ T","CD4+ T","Tregs","B/Plasma cells")
+immune_clean$cell_type <- factor(immune_clean$cell_type, levels = ct_order)
+Idents(immune_clean) <- "cell_type"
+
+Clustered_DotPlot(immune_clean, features = genes, column_label_size = 20)
+ggsave(paste0("immune_annotation_dotplot_", format(Sys.Date(),"%Y%m%d"), ".pdf"),
+       width = 9, height = 13)
+
+## ---- UMAP with final labels ----
+DimPlot_scCustom(immune_clean, reduction = 'umap', group.by = "cell_type", label = TRUE, repel = TRUE) + NoAxes()
+ggsave(paste0("immune_annotation_umap_", format(Sys.Date(),"%Y%m%d"), ".pdf"),
+       width = 9, height = 7)
+
+## ---- Save the annotated object ----
+saveRDS(immune_clean, "immune_clean_annotated.rds")
+cat("[Saved] immune_clean_annotated.rds\n")
+
+library(CellChat); library(Seurat); library(dplyr); library(patchwork)
+options(stringsAsFactors = FALSE)
+setwd("~/Documents/revisions")
+
+## ============================================================
+## 1) Merge NEW immune labels onto all_prim, WIPE old coarse immune
+## ============================================================
+all_prim      <- readRDS("all_prim_with_fine_annotation.rds")
+immune_clean  <- readRDS("immune_clean_annotated.rds")
+
+## start from the fine (epithelial) annotation
+all_prim$finer_annotation <- as.character(all_prim$fine_annotation)
+
+## WIPE the old coarse immune labels -> NA (removes leftover B-cells/T-cells/Macrophages)
+old_immune <- c("B-cells", "T-cells", "Macrophages")
+all_prim$finer_annotation[all_prim$finer_annotation %in% old_immune] <- NA
+
+## PAINT in the new fine immune labels by barcode
+imm <- setNames(as.character(immune_clean$cell_type), colnames(immune_clean))
+common <- intersect(names(imm), colnames(all_prim))
+all_prim$finer_annotation[common] <- imm[common]
+cat("Painted", length(common), "immune cells with new labels\n")
+
+## ---- verify old coarse immune are gone ----
+cat("Old coarse immune remaining (must be 0):",
+    sum(all_prim$finer_annotation %in% old_immune, na.rm = TRUE), "\n")
+cat("NA cells (excluded):", sum(is.na(all_prim$finer_annotation)), "\n\n")
+
+## drop NA cells (old immune not re-annotated + removed contaminants) for CellChat
+all_prim_cc <- subset(all_prim, subset = !is.na(finer_annotation))
+all_prim_cc$finer_annotation <- droplevels(factor(all_prim_cc$finer_annotation))
+cat("Final cell types going into CellChat:\n")
+print(table(all_prim_cc$finer_annotation))
+
